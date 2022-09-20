@@ -1,0 +1,598 @@
+---
+title: "SpeedingCARs_Data Analysis"
+author: "Rocio Castellanos-Rueda"
+date: "19.09.2022"
+output: html_notebook
+---
+
+This script serves to analyse the scRNAseq data generated from pooled CAR T cells.
+
+# Load Libraries and set WD 
+```{r}
+
+setwd("~/ --- ")
+
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(viridis)
+library(gridExtra)
+library(RColorBrewer)
+library("pheatmap")
+library(UCell)
+library(mclust)
+library(gprofiler2)
+library(circlize)
+
+```
+
+# Functions 
+```{r}
+
+### Make function to delete genes to avoid clustering biases
+geneTCR <- function(Data = seurat){
+  TCR.features <- c(grep("^TRAV", rownames(Data)),
+                    grep("^TRAJ", rownames(Data)),
+                    grep("^TRBV", rownames(Data)),
+                    grep("^TRBD", rownames(Data)),
+                    grep("^TRBJ", rownames(Data)),
+                    grep("^XIST", rownames(Data))) ## also added this gene cause it was differentiation sex of donors
+  return(TCR.features)
+}
+
+
+```
+
+# 1.1: Loading of seurat objects and addition of metadata annotations 
+```{r}
+
+### input: raw file data directory, name of sample, CAR annotation .csv
+### outpout: list with seurat objects
+
+
+Samples <- c("D1_2DomLib",
+             "D1_2DomLib_WT",
+             "D2_2DomLib_WT",
+             "D3_2DomLib_1",
+             "D3_2DomLib_2",
+             "D3_2DomLib_WT")
+
+Annotation <- c("D1_2DomLib_barcodes_assigned.csv",
+                "D1_2DomLib_WT_barcodes_assigned.csv",
+                "D2_2DomLib_WT_barcodes_assigned.csv",
+                "D3_2DomLib_1_barcodes_assigned.csv",
+                "D3_2DomLib_2_barcodes_assigned.csv",
+                "D3_2DomLib_WT_barcodes_assigned.csv")
+
+raw <- list()
+
+for (j in 1:length(Samples)) {
+  
+  ## loading Count matrix
+  object <- Read10X(data.dir = Samples[j])
+  
+  ### Delete TCR genes to avoid clustering by clones
+  features_to_delete <- geneTCR(Data = object)
+  object <- object[-features_to_delete,]
+  
+  ## make seurat object
+  object  <- CreateSeuratObject(object, project= Samples[j])
+  ### assign CAR variants
+  CAR_annotation <- read.csv(Annotation[j]) %>% select( -X)
+  object  <- AddMetaData(
+    object = object ,
+    metadata = CAR_annotation$CAR,
+    col.name = "CAR_Variant"
+  )
+  
+  raw[[j]] <- object
+  
+}
+
+names(raw) <- Samples 
+
+```
+
+# 1.2: Loading of control samples (incorporation into list of seurat objects in 1.1)
+```{r}
+
+control_Samples <- c("D2_Unstim_28z",
+                     "D3_hT")
+
+Annotation <- c("unstim-CD28-CD3Z",
+                "hT")
+
+for (j in 1:length(control_Samples)) {
+  
+  ## loading Count matrix
+  object <- Read10X(data.dir = control_Samples[j])
+  
+  ### Delete TCR genes to avoid clustering by clones (function described above)
+  features_to_delete <- geneTCR(Data = object)
+  object <- object[-features_to_delete,]
+  
+  ## make seurat object
+  object  <- CreateSeuratObject(object, project= control_Samples[j])
+  object<- AddMetaData(
+    object = object,
+    metadata = Annotation[j],
+    col.name = "CAR_Variant")
+  
+  raw[[j+ length(Samples)]] <- object
+  
+}
+
+
+names(raw) <- c(Samples, control_Samples)
+
+
+```
+
+# 2.1: scRNAseq QC and data filtering 
+```{r}
+
+### Merge seurat objects
+data.combined <- merge(raw[[1]], y = c(raw[c(2:length(raw))]), add.cell.ids = c(names(raw)))
+
+#Plot number of cells per sample before QC
+p1 <-  ggplot(data.combined@meta.data, aes(orig.ident))+geom_bar(stat="count")+ theme(text = element_text(),axis.text.x = element_text(angle=45, hjust=1)) + geom_text(stat='count', aes(label=..count..), vjust=-1)
+
+# Name edits
+data.combined$CAR_Variant <-  gsub(' ','', data.combined$CAR_Variant)
+data.combined$CAR_Variant <-  gsub('HVEM','HVEML', data.combined$CAR_Variant)
+data.combined$CAR_Variant <-  gsub('4-1BB','41BB', data.combined$CAR_Variant)
+
+### Filter out cells that dont have a CAR assigned
+Domain_A <- c("CD28", "41BB", "CD4", "CD150", "HVEML", "CD30", "CD84", "CD357", "CD244", "CD226", "FCRL6","FCRL1",
+              "CD223", "DR3","TIM1")
+Domain_B <- c("CD3Z",	"LMP2",	"K1",	"FCGR2A",	"FCER1G",	"DAP12",	"CD79B",	"CD79A",	"CD3G",	"CD3E",	"CD3D",	"GP")
+variants <- paste(rep(Domain_A, each = length(Domain_B)), Domain_B, sep = "-")
+
+## To include control groups
+ variants <- append(variants, "hT") 
+ variants <- append(variants, "unstim-CD28-CD3Z") 
+
+data.combined <- subset(data.combined, cells = (rownames(data.combined@meta.data[data.combined@meta.data$CAR_Variant %in% variants,])))
+
+### Filter out cells that dont express CD45 and Express HER2 (To get rid of SKBR3 cells)
+data.combined <- subset(data.combined, cells = WhichCells(data.combined, expression = PTPRC > 0))
+data.combined <- subset(data.combined, cells = WhichCells(data.combined, expression = ERBB2 < 2.5))
+
+### Add to metadata percentage of cells expressing mitocondrial genes
+data.combined[["percent.mt"]] <- PercentageFeatureSet(data.combined, pattern = "^MT[-\\.]")
+
+### violin plot of metadata information before filtering
+p2 <- VlnPlot(data.combined, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),group.by = "orig.ident", ncol = 3, pt.size=0)
+
+### QC filtering + violin plot of metadata information after filtering
+seurat <- subset(data.combined, subset = nFeature_RNA > 500 & nFeature_RNA < 10000 & percent.mt < 15)
+p4 <- VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),group.by = "orig.ident", ncol = 3, pt.size=0)
+
+#Plot number of cells per sample before and after QC # BEFORE SUBSETTING ASSIGNED CELLS
+p3 <- ggplot(seurat@meta.data, aes(orig.ident))+geom_bar(stat="count")+ theme(text = element_text(),axis.text.x = element_text(angle=45, hjust=1)) + geom_text(stat='count', aes(label=..count..), vjust=-1)
+
+p1 
+p3
+p2
+p4
+
+```
+
+# 2.3: Random subsampling of a maximum of 250 cells per CAR variant and 500 cells per control
+```{r}
+
+##first subsample CAR variants only
+variants <- paste(rep(Domain_A, each = length(Domain_B)), Domain_B, sep = "-")
+seurat_CAR <- subset(seurat, cells = (rownames(seurat@meta.data[seurat@meta.data$CAR_Variant %in% variants,])))
+
+cell_names <- rownames(seurat_CAR@meta.data[seurat_CAR@meta.data$CAR_Variant %in% c(variants),]) 
+temp <- data.frame(cell_names,seurat_CAR$CAR_Variant)
+temp <- split(temp , temp$seurat_CAR.CAR_Variant)
+set.seed(42) 
+temp <- do.call(rbind,lapply(X = temp, FUN = function(d) {
+  d <- if (nrow(d) > 250) {
+    sample_n(d,size = 250, replace = FALSE)
+  }
+  else{ d }
+}))
+seurat_CAR <- subset(seurat_CAR, cells = temp$cell_names)
+
+## then do controls separately
+
+controls <- c("hT", "unstim-CD28-CD3Z")
+seurat_C <- subset(seurat, cells = (rownames(seurat@meta.data[seurat@meta.data$CAR_Variant %in% controls,])))
+
+cell_names <- rownames(seurat_C@meta.data[seurat_C@meta.data$CAR_Variant %in% c(controls),]) #variants vector from 2.1A
+temp <- data.frame(cell_names,seurat_C$CAR_Variant)
+temp <- split(temp , temp$seurat_C.CAR_Variant)
+set.seed(42) 
+temp <- do.call(rbind,lapply(X = temp, FUN = function(d) {
+  d <- if (nrow(d) > 500) {
+    sample_n(d,size = 500, replace = FALSE)
+  }
+  else{ d }
+}))
+seurat_C <- subset(seurat_C, cells = temp$cell_names)
+
+seurat_subset <- merge(seurat_CAR, y = c(seurat_C))
+
+```
+
+# 3.1: scRNAseq data processing; Normalzation, Scaling, Integration, dim. reduction and cell clustering
+```{r}
+
+#seurat <- seurat_subset
+
+### Split the dataset into a list of seurat objects based on sample origin
+seurat.list <- SplitObject(seurat, split.by = "orig.ident")
+
+### MAke list of cell cycle genes
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+### normalize and identify variable features for each sample independently
+seurat.list <- lapply(X = seurat.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+  x <- CellCycleScoring(x, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+})
+
+
+### select features across datasets for integration and run PCA on each dataset using these features
+features <- SelectIntegrationFeatures(object.list = seurat.list, nfeatures = 2000)
+seurat.list <- lapply(X = seurat.list, FUN = function(x) {
+  x <- ScaleData(x, features = features, verbose = FALSE)
+  x <- RunPCA(x, features = features, verbose = FALSE)
+})
+
+###integration
+immune.anchors <- FindIntegrationAnchors(object.list = seurat.list, anchor.features = features, reduction = "rpca")
+
+### this command creates an 'integrated' data assay
+immune.combined <- IntegrateData(anchorset = immune.anchors) 
+
+### specify that we will perform downstream analysis on the integrated data 
+# original unmodified data still resides in the 'RNA' assay
+DefaultAssay(immune.combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+immune.combined <- ScaleData(immune.combined, verbose = FALSE , vars.to.regress = c("S.Score", "G2M.Score"))
+immune.combined <- RunPCA(immune.combined, npcs = 30, verbose = FALSE)
+
+immune.combined <- RunUMAP(immune.combined, reduction = "pca", dims = 1:20) 
+immune.combined <- FindNeighbors(immune.combined, reduction = "pca", dims = 1:20)  
+immune.combined <- FindClusters(immune.combined, resolution = 0.85)
+
+DefaultAssay(immune.combined) <- "RNA"
+
+seurat <- immune.combined # normalize and scale again 
+seurat <- NormalizeData(seurat)
+seurat <- ScaleData(seurat, features = rownames(seurat)) # takes quite long
+
+UMAPPlot(seurat, label=TRUE)
+
+```
+
+# 3.2: Save and reload previously processed seurat objects 
+```{r}
+
+#saveRDS(seurat, "SpeedingCARs.rds") 
+#seurat <- readRDS("SpeedingCARs.rds")
+
+```
+
+# 4.0: Data analysis: preparation of useful vector / metadata
+```{r}
+
+### vector with top represented candidates
+temp <- table(seurat$CAR_Variant)
+t <- reshape2::melt(temp) %>% filter(value > 49)
+t<-  arrange(t, value)
+candidates <- rev(as.character(t$Var1))
+
+### Vector with all CAR variants
+Domain_A <- c("CD28", "41BB", "CD4", "CD150", "HVEML", "CD30", "CD84", "CD357", "CD244", "CD226", "FCRL6","FCRL1",
+              "CD223", "DR3","TIM1")
+Domain_B <- c("CD3Z",	"LMP2",	"K1",	"FCGR2A",	"FCER1G",	"DAP12",	"CD79B",	"CD79A",	"CD3G",	"CD3E",	"CD3D",	"GP")
+variants <- paste(rep(Domain_A, each = length(Domain_B)), Domain_B, sep = "-")
+
+### Add donor information to metadata
+seurat@meta.data$Donor <- seurat@meta.data$orig.ident
+
+seurat@meta.data$Donor <- gsub('D1_2DomLib_WT','D1', seurat@meta.data$Donor)
+seurat@meta.data$Donor <- gsub('D1_2DomLib','D1', seurat@meta.data$Donor)
+seurat@meta.data$Donor <- gsub('D2_2DomLib_WT','D2', seurat@meta.data$Donor)
+seurat@meta.data$Donor <- gsub('D2_Unstim_28z','D2', seurat@meta.data$Donor)
+seurat@meta.data$Donor <- gsub('D3_2DomLib_1','D3', seurat@meta.data$Donor)
+seurat@meta.data$Donor <- gsub('D3_2DomLib_2','D3', seurat@meta.data$Donor)
+seurat@meta.data$Donor <- gsub('D3_2DomLib_WT','D3', seurat@meta.data$Donor)
+seurat@meta.data$Donor <- gsub('D3_hT','D3', seurat@meta.data$Donor)
+unique(seurat@meta.data$Donor)
+
+seurat@meta.data$CAR_Variant_Donor <-paste(seurat@meta.data$CAR_Variant,seurat@meta.data$Donor, sep = "-")
+head(seurat@meta.data)
+
+```
+
+# 4.1: Data analysis: UMAPs
+```{r}
+
+# verify integration
+DimPlot(seurat, reduction = "pca", split.by = "orig.ident")
+
+## To change identity
+Idents(seurat) <- 'CAR_Variant'
+Idents(seurat) <- 'seurat_clusters'
+
+### UMAP plots
+UMAPPlot(seurat, label=TRUE)
+UMAPPlot(seurat, group.by = "orig.ident")
+UMAPPlot(seurat, split.by = "orig.ident")
+UMAPPlot(seurat, group.by = "Phase")
+UMAPPlot(seurat, group.by = "CAR_Variant")
+
+### UMAP highlighting single variants
+candidates_plot <- candidates[!candidates %in% c("hT","unstim-CD28-CD3Z","CD28-CD3Z","41BB-CD3Z")]
+candidates_plot <- c("hT","unstim-CD28-CD3Z","CD28-CD3Z","41BB-CD3Z")
+
+UMAPs <- list()
+palette <- c(viridis(50))
+for (i in 1:length(candidates_plot)) {
+  CAR <- candidates_plot[i]
+  cells <- c(rownames(seurat@meta.data[seurat@meta.data$CAR_Variant == CAR,]))
+  colour <- palette[i]
+  UMAPs[[i]] <- UMAPPlot(seurat, cells.highlight = cells, cols.highlight = colour)+ 
+    NoLegend() +
+    #no.axes () +
+    ggtitle(CAR) +  theme(plot.title = element_text(hjust = 0.5))  # title
+}
+
+do.call("grid.arrange", c(UMAPs, ncol=8))
+
+```
+
+# 4.2: Data analysis: Feature plots
+```{r}
+
+### Feature plots
+
+features <- c("PRF1","GZMB","GZMA","GZMH","GZMK","GNLY","NKG7","KLRD1",
+              "XCL1","XCL2","CCL3","CCL4","CCL5","CSF2","CCR5","CCR6","CXCR3","CXCR6","ITGB1","ITGAE",
+              "CRTAM", "IFNG","RGS16","TNFRSF9","TNFRSF8","TNFRSF18","NPW","LAIR2","ID3","DUSP4","LAYN","IL2RA",
+              "ENTPD1","TIGIT","LAG3","PDCD1",
+              "ZBED2","EOMES","SOX4","BATF3","TCF7","LEF1",
+              "CCR7","IL7R","CD27", "CD7",         
+              "HLA-DPB1","HLA-DRA",
+              "IL17RB", "IL26","LIF","CD40LG","IL17RB","IL13","IL4I1" )
+
+
+p <- FeaturePlot(seurat, features , combine = FALSE, 
+                 pt.size=0.001, label = FALSE)
+
+for(i in 1:length(p)) {
+  p[[i]] <- p[[i]] + NoLegend() + NoAxes()
+}
+
+cowplot::plot_grid(plotlist = p, ncol = 7)
+
+```
+
+
+# 4.3: Data analysis: Dot plots 
+```{r}
+
+features <- c("IL17RB","IL13","IL4I1","IL26","LIF","CD40LG",
+              "HLA-DPB1","HLA-DRA","HLA-DQA1","HLA-DRB5",
+              "KLF2","CD7","CCR7","IL7R","CD27",
+              "LEF1","TCF7","FOXP3","STAT1","EOMES","EGR2","ZBED2","TBX21", "HOPX","ZNF683","SOX4","JUN","BATF3",
+              "PDCD1","CTLA4","TIGIT","LAG3","ENTPD1",
+              "TNFSF13B","TNFRSF18","TNFRSF8","TNFRSF4","IL2RA","LAYN","DUSP4","LAIR2","NPW","ID3","TNFRSF9","RGS16","IFNG","CRTAM",
+              "CXCR6","CXCR3","CCR6","CCR5","CCR4","ITGB1","ITGAE",
+              "XCL2","XCL1","CCL3","CCL4","CCL5","CSF2",
+              "KLRG1","KLRK1","KLRD1","GZMH","GZMK","GNLY","GZMA","GZMB","PRF1","NKG7",
+              "MKI67","CD8A","CD4")
+  
+
+DotPlot(object = seurat, features = features, group.by = "seurat_clusters") + RotatedAxis()+ coord_flip()+
+    scale_color_gradientn(colors = rev(brewer.pal(n = 7, name = "RdYlBu")))
+
+```
+
+# 4.4: Data analysis: DGE
+```{r}
+
+### DGE between all clusters
+cl_markers <- FindAllMarkers(seurat, only.pos = TRUE, min.pct = 0.25, min.diff.pct = 0.05, logfc.threshold = log(1.2))
+
+### Top genes per cluster
+top50_cl_markers <- cl_markers %>% group_by(cluster) %>% top_n(n = 50, wt = avg_log2FC)
+DoHeatmap(seurat, features = top50_cl_markers$gene) + NoLegend()
+#write.csv(top50_cl_markers, "top50_cl_markers.csv" )
+
+### More than 2 fold DE genes
+top10_cl_markers <- cl_markers %>% filter(avg_log2FC > 1)
+DoHeatmap(seurat, features = top10_cl_markers$gene) + NoLegend()
+
+```
+
+# 4.5: Data analysis: cluster anotation // cluster enrichment
+
+```{r}
+
+### cluster annotation (If names include a number those clusters need to be annotated first, two digits should be done after that)
+seurat@meta.data$seurat_clusters <-gsub('4','CD4_Activated_Memory', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('8','CD4_Cycling_Memory', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('10','CD4_CD8', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('11','CD8_Cytotoxic', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('3','CD8_Terminal_Effector', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('5','CD8_BATF3+', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('12','CD4_Effector', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('0','CD8_Effector_B', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('1','CD4_Resting_Memory', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('2','CD8_Memory', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('7','CD4_Activated', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('6','CD4_Resting_KLF2+', seurat@meta.data$seurat_clusters)
+seurat@meta.data$seurat_clusters <-gsub('9','CD8_Effector_A', seurat@meta.data$seurat_clusters)
+
+
+order_clust <- c("CD8_BATF3+","CD8_Terminal_Effector","CD8_Cytotoxic","CD8_Effector_A","CD8_Effector_B","CD8_Memory","CD4_Resting_Memory","CD4_Cycling_Memory","CD4_Activated_Memory","CD4_Resting_KLF2+","CD4_Activated","CD4_Effector","CD4_CD8")
+seurat$seurat_clusters <- factor(seurat$seurat_clusters, levels=order_clust) # order levels
+UMAPPlot(seurat, group.by= "seurat_clusters")
+
+grid.col <- c("CD8_BATF3+"='#40004b',"CD8_Terminal_Effector"='#67001f',"CD8_Cytotoxic"='#a50026',"CD8_Effector_A"='#d73027',"CD8_Effector_B"='#f46d43',"CD8_Memory"='#fdae61',"CD4_Resting_Memory"='#fee08b',"CD4_Cycling_Memory"='#ffffbf',"CD4_Activated_Memory"='#d9ef8b',"CD4_Resting_KLF2+"='#a6d96a',"CD4_Activated"='#1a9850',"CD4_Effector"='#006837',"CD4_CD8"='#969696')
+
+UMAPPlot(seurat, group.by= "seurat_clusters",cols= grid.col)
+
+```
+
+
+# 5.1 Pseudobulking 
+```{r}
+
+# Optional : subset data
+Idents(seurat) <- 'Donor'
+D3  <- subset(seurat, cells = WhichCells(seurat, idents = "D3"))
+
+# Filter variants
+temp <- table(D3$CAR_Variant)
+t <- reshape2::melt(temp) %>% filter(value > 40)
+candidates_ctr <- as.character(t$Var1)
+
+Idents(D3) <- 'CAR_Variant' ## Identity by which cells will be bulked
+D3 <- NormalizeData(D3) ## If seurat object hasn't been normalised this should be done first
+
+cluster.averages <- AverageExpression(D3, return.seurat = TRUE )
+
+#a <- (cluster.averages@assays[["RNA"]]@scale.data[,candidates_ctr])      # Average expression of scaled data
+a <- (cluster.averages@assays[["RNA"]]@data[,candidates_ctr])             # Average expression of raw counts
+
+library(PCAtools)
+p <- pca(a)
+screeplot(p, axisLabSize = 18, titleLabSize = 22)
+biplot(p, lab = colnames(a))
+
+
+```
+
+
+#5.2 CD4/CD8 Pseudobulkning 
+```{r}
+
+CD4 <- (WhichCells(seurat, expression = CD4 > 0 & CD8A < 0.2))
+
+CD8 <- (WhichCells(seurat, expression = CD8A > 0 & CD4 < 0.2))
+
+seurat$subset <- rownames(seurat@meta.data)
+
+`%notin%` <- Negate(`%in%`)
+seurat$subset[which(seurat$subset %notin% c(CD8,CD4))] <- "NA"
+seurat$subset[which(seurat$subset %in% CD4)] <- "CD4"
+seurat$subset[which(seurat$subset %in% CD8)] <- "CD8"
+
+temp <- table(seurat$CAR_Variant)
+t <- reshape2::melt(temp) %>% dplyr::filter(value > 50)
+t<-  arrange(t, value)
+candidates <- rev(as.character(t$Var1))
+
+seurat_subset <- subset(seurat, cells = rownames(filter(seurat@meta.data, subset != "NA")%>%
+                                                filter(CAR_Variant %in% candidates)))
+seurat_subset$CAR_sub <- paste(seurat_subset$CAR_Variant,seurat_subset$subset, sep="_")
+temp <- table(seurat_subset$CAR_sub)
+t <- reshape2::melt(temp)%>% dplyr::filter(value > 10)
+candidates_ctr <- as.character(t$Var1)
+
+Idents(seurat_subset) <- "CAR_sub"
+## If seurat object hasnt been normalised this should be donde first
+seurat_subset <- NormalizeData(seurat_subset)
+cluster.averages <- AverageExpression(seurat_subset, return.seurat = TRUE) 
+
+features <- c("NKG7","PRF1","GZMB","GZMA","GZMK","GZMH",
+              "CSF2","XCL1","XCL2","CCL3","CCL4","CCL5","ITGAE",
+              "CRTAM", "IFNG","RGS16","RBPJ","TNFRSF9", "ID3","NPW","LAIR2","DUSP4","LAYN","IL2RA",
+              "ENTPD1","LAG3","TIGIT","PDCD1",
+              "ZBED2","SOX4", "IRF4","JUN","BATF3","TCF7","LEF1",
+              "CCR7","IL7R","CD27", "CD7","LTB","SELL","KLF2")
+
+a <- cluster.averages@assays[["RNA"]]@scale.data[features,]
+
+## Plot gene expression of a selection of CD8 pseudo-bulked samples
+b <- a[,c("FCRL6-CD3G_CD8", "CD28-FCGR2A_CD8", "4-1BB-FCGR2A_CD8", "CD223-CD79A_CD8", "FCRL6-FCGR2A_CD8",
+          "CD30-CD79B_CD8", "CD4-K1_CD8","CD244-K1_CD8",
+          "CD28-CD3Z_CD8" , "4-1BB-CD3Z_CD8","hT_CD8","unstim-CD28-CD3Z_CD8",
+          "TIM1-CD79B_CD8", "CD30-CD3D_CD8")]
+
+breaksList = seq(-2.5, 4, by = 0.001)
+pheatmap(t(b), 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(breaksList)),
+         breaks = breaksList, angle_col = 45)
+
+
+```
+
+# 6: Single cell scoring 
+```{r}
+
+#Using UCell package
+
+### Load data (Upload non subsampled data)
+seurat <- readRDS("D1-3_All_AfterQC_light.rds") # 2.5 GB
+
+### Load and make a list of gene sets
+markers <- list()
+genes <- read.csv("Genes.csv")
+names <- colnames(genes)
+
+for (i in 1:ncol(genes)) {
+  temp <- genes [,i]
+  markers[[i]] <- temp[temp != ""]
+}
+names(markers) <- names
+
+#Make gene scores using Ucell
+seurat <- AddModuleScore_UCell(seurat, features = markers)
+
+score_names <- names(markers)
+names2 <- colnames(seurat@meta.data)
+df <- as_data_frame(cbind(seurat@meta.data["CAR_Variant"]))
+
+for (i in 1:length(score_names)) {
+  df <- cbind(df,seurat@meta.data[[13+i]])
+}
+
+colnames(df) <-c("CAR_Variant", score_names)
+
+## remove variants with low cell count
+temp <- table(seurat$CAR_Variant)
+t <- reshape2::melt(temp) %>% filter(value > 49)
+candidates <- as.character(t$Var1)
+df <- filter(df, CAR_Variant %in% candidates)
+
+## for each gene set compute the mean score per variant
+i <- 1
+temp <- filter(df,CAR_Variant == candidates[i]) %>% select(- CAR_Variant)
+mean <- data.frame(sapply(temp,FUN=mean))
+for (i in 2:length(candidates)) {
+  temp <- filter(df,CAR_Variant == candidates[i]) %>% select(- CAR_Variant)
+  mean <- cbind(mean, data.frame(sapply(temp,FUN=mean)))
+}
+
+colnames(mean) <- candidates
+
+mean_FC <- mean / mean$`CD28-CD3Z`
+
+paletteLength <- 50
+myColor <- colorRampPalette(c("purple", "#f0f0f0", "orange"))(paletteLength)
+myBreaks <- c(seq(min(mean_FC), 1, length.out=ceiling(paletteLength/2) + 1), 
+              seq(1.1, 2, length.out=floor(paletteLength/2)))
+
+pheatmap(mean_FC, color=myColor, breaks=myBreaks, cluster_rows = FALSE)
+
+
+## One can also plot scores in a UMAP
+FeaturePlot(object = seurat, features = "Cytotoxicity_UCell")
+
+                   
+```
+
